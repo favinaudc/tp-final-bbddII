@@ -1,0 +1,84 @@
+services:
+  crdb-node1:
+    image: cockroachdb/cockroach:v25.2.16
+    container_name: crdb-node1
+    hostname: crdb-node1
+    command: >
+      start
+      --insecure
+      --advertise-addr=crdb-node1:26257
+      --listen-addr=:26257
+      --http-addr=:8080
+      --join=crdb-node1:26257,crdb-node2:26257,crdb-node3:26257
+      --cache=25%
+      --max-sql-memory=25%
+    ports:
+      - "8080:8080"
+    volumes:
+      - crdb_data_1:/cockroach/cockroach-data
+    networks:
+      - biocustodia_net
+
+  crdb-node2:
+    image: cockroachdb/cockroach:v25.2.16
+    container_name: crdb-node2
+    hostname: crdb-node2
+    command: >
+      start
+      --insecure
+      --advertise-addr=crdb-node2:26257
+      --listen-addr=:26257
+      --http-addr=:8080
+      --join=crdb-node1:26257,crdb-node2:26257,crdb-node3:26257
+      --cache=25%
+      --max-sql-memory=25%
+    ports:
+      - "8081:8080"
+    volumes:
+      - crdb_data_2:/cockroach/cockroach-data
+    networks:
+      - biocustodia_net
+
+  crdb-node3:
+    image: cockroachdb/cockroach:v25.2.16
+    container_name: crdb-node3
+    hostname: crdb-node3
+    command: >
+      start
+      --insecure
+      --advertise-addr=crdb-node3:26257
+      --listen-addr=:26257
+      --http-addr=:8080
+      --join=crdb-node1:26257,crdb-node2:26257,crdb-node3:26257
+      --cache=25%
+      --max-sql-memory=25%
+    ports:
+      - "8082:8080"
+    volumes:
+      - crdb_data_3:/cockroach/cockroach-data
+    networks:
+      - biocustodia_net
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    container_name: biocustodia-haproxy
+    ports:
+      - "26257:26257"
+      - "8404:8404"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - crdb-node1
+      - crdb-node2
+      - crdb-node3
+    networks:
+      - biocustodia_net
+
+volumes:
+  crdb_data_1:
+  crdb_data_2:
+  crdb_data_3:
+
+networks:
+  biocustodia_net:
+    driver: bridge
