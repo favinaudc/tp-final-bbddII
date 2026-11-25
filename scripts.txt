@@ -1,0 +1,191 @@
+# Levantar archivo docker compose
+
+    docker compose up -d
+
+
+# Inicializar el clúster
+
+    docker exec -it crdb-node1 cockroach init --insecure --host=crdb-node1:26257
+
+    ## Comprobar el estado de los nodos
+
+        docker exec crdb-node1 cockroach node status --insecure --host=crdb-node1:26257
+
+
+# Registrar las versiones exactas
+
+    ## Versión de CockroachDB en los tres nodos (demuestra homogeneidad)
+        docker exec crdb-node1 cockroach version
+        docker exec crdb-node2 cockroach version
+        docker exec crdb-node3 cockroach version
+
+    ## Versión de HAProxy
+        docker exec biocustodia-haproxy haproxy -v
+
+
+# Verificar estado del clúster y modalidad de licencia
+
+    # Estado de los 3 nodos (todos deben figurar is_available = true, is_live = true)
+        docker exec crdb-node1 cockroach node status --insecure --host=crdb-node1:26257
+
+
+# Crear la base biocustodia, la tabla y cargar los 100.005 registros (vía HAProxy)
+
+    ## Si se usa psql desde el host:
+        psql "postgresql://root@localhost:26257/defaultdb?sslmode=disable" -f sql/01_schema_y_datos.sql 
+
+    ## O si se usa el contenedor cliente de CockroachDB sin instalar psql:
+        docker run --rm -i --network tp-final_biocustodia_net cockroachdb/cockroach:v25.2.16 sql --insecure --host=haproxy:26257 < sql/01_schema_y_datos.sql
+        
+
+    ## Endpoint para ver el estado/salud del HAProxy
+        http://localhost:8404/stats
+
+    ## Endpoint para ver el estado/salud de los clusters de CockroachDB
+        http://localhost:8080
+
+# V1: Punto único de acceso 
+
+    ## Datos de Conexión para DBeaver
+
+        Host: localhost
+
+        Port: 26257
+
+        Database: biocustodia
+
+        Username: root (sin contraseña)
+
+        SSL: desactivado (sslmode=disable)
+
+    ## SELECT crdb_internal.node_id() AS nodo_atencion, count(*) AS total_lotes FROM contenedores_crio;
+
+
+# V2: Replicación
+
+    ## SHOW RANGES FROM TABLE biocustodia.contenedores_crio WITH DETAILS;
+
+
+# V3: Balanceo
+
+    ## Abrir pestañas y consultar el nodo + id de la conexión 
+
+        SELECT crdb_internal.node_id() AS nodo_asignado, pg_backend_pid() AS id_conexion;
+
+
+# V4: Caída y Recuperación
+
+    ## Detener nodo -> docker stop X
+
+    ## Crear nueva conexión
+
+        SELECT crdb_internal.node_id() AS nodo_atencion;
+
+        INSERT INTO biocustodia.contenedores_crio (
+            lote_id, codigo_contenedor, laboratorio_origen, compuesto,
+            temperatura_c, dosis_disponibles, estado_custodia
+        ) VALUES (
+            900001, 'CRIO-FAILOVER-01', 'BioSur Patagonia', 'Suero Prueba Caida',
+            -75.00, 100, 'ALMACENADO'
+        );
+
+        SELECT * FROM biocustodia.contenedores_crio WHERE lote_id = 900001;
+
+    ## Levantar nodo
+
+    ## Identificar el nodo y ejecurtar
+
+        SELECT crdb_internal.node_id() AS nodo, lote_id, codigo_contenedor, compuesto
+        FROM biocustodia.contenedores_crio
+        WHERE lote_id = 900001;
+
+
+# V5: Concurrencia (habilitar autocommit)
+
+    ## Seleccionar 2 conexiones
+
+    ## (NodoA) Ejecutar consulta y dejarla abierta para bloquear el recurso
+
+        BEGIN;
+
+            SELECT lote_id, codigo_contenedor, dosis_disponibles, estado_custodia
+            FROM biocustodia.contenedores_crio
+            WHERE lote_id = 1
+            FOR UPDATE;
+
+    ## (NodoB) Intentar modificar el mismo lote 1
+
+        BEGIN;
+
+        UPDATE biocustodia.contenedores_crio
+        SET dosis_disponibles = dosis_disponibles - 50,
+            estado_custodia = 'EN_TRANSITO'
+        WHERE lote_id = 1;
+
+
+    ## (NodoA) Ejecutar consulta y dejarla abierta para bloquear el recurso
+
+        UPDATE biocustodia.contenedores_crio
+        SET dosis_disponibles = dosis_disponibles - 100
+        WHERE lote_id = 1;
+
+        COMMIT;
+
+    ## (NodoB) Commitear?
+
+        COMMIT;
+
+
+    ## Verificar estado final del registro y volver a activar auto-commit
+
+        SELECT lote_id, codigo_contenedor, dosis_disponibles, estado_custodia
+        FROM biocustodia.contenedores_crio
+        WHERE lote_id = 1;
+
+
+# V6: Cambio de esquema en línea
+
+    ## Preparación (agregar más registros de onda):
+
+        INSERT INTO biocustodia.contenedores_crio (
+            lote_id, codigo_contenedor, laboratorio_origen, compuesto,
+            temperatura_c, dosis_disponibles, estado_custodia, ultimo_control
+        )
+        SELECT
+            g,
+            'CRIO-LOT-' || lpad(g::STRING, 6, '0'),
+            CASE (g % 5) WHEN 0 THEN 'BioSur Patagonia' WHEN 1 THEN 'Instituto Austral' WHEN 2 THEN 'CryoLab Córdoba' WHEN 3 THEN 'Genoma Norte' ELSE 'Biotech Cuyo' END,
+            CASE (g % 4) WHEN 0 THEN 'Vacuna ARNm-V4' WHEN 1 THEN 'Plasma Hiperinmune' WHEN 2 THEN 'Células Madre CD34+' ELSE 'Enzima Polimerasa Taq' END,
+            (-20.00 - (g % 175))::DECIMAL(5,2),
+            10 + (g % 990),
+            CASE (g % 4) WHEN 0 THEN 'ALMACENADO' WHEN 1 THEN 'EN_TRANSITO' WHEN 2 THEN 'CUARENTENA' ELSE 'DESPACHADO' END,
+            now() - ((g % 720) || ' hours')::INTERVAL
+        FROM generate_series(100006, 250005) AS g
+        ON CONFLICT (lote_id) DO NOTHING;
+
+    ## Pestaña 1 (creación de indices):
+
+        CREATE INDEX idx_crio_lab_estado_temp
+        ON biocustodia.contenedores_crio (laboratorio_origen, estado_custodia, temperatura_c);
+
+    ## Pestaña 2
+
+        SELECT job_id, job_type, description, status, fraction_completed, created, finished
+        FROM [SHOW JOBS]
+        WHERE job_type LIKE '%SCHEMA%'
+        ORDER BY created DESC
+        LIMIT 5;
+
+    ## Pestaña 3
+
+        UPDATE biocustodia.contenedores_crio
+        SET temperatura_c = -78.90, ultimo_control = now()
+        WHERE lote_id = 4
+        RETURNING crdb_internal.node_id() AS nodo, lote_id, temperatura_c, ultimo_control;
+
+
+    ## Final -> Pestaña 1
+
+        SHOW INDEXES FROM biocustodia.contenedores_crio;
+
+        SHOW JOBS;
